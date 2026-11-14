@@ -188,6 +188,7 @@ cc_defaults {
     defaults: ["update_metadata-protos_exports"],
 
     static_libs: [
+        "libavb",
         "libxz",
         "libbz",
         "libbspatch",
@@ -1355,6 +1356,7 @@ cc_test {
     ],
 
     static_libs: [
+        "libavb",
         "libbrillo-test-helpers",
         "libbase",
         "liblog",

@@ -28,6 +28,7 @@
 #include <fstream>
 #include <string>
 
+#include <android-base/properties.h>
 #include <base/files/file_path.h>
 #include <base/files/file_util.h>
 #include <base/logging.h>
@@ -39,6 +40,7 @@
 #include "update_engine/common/platform_constants.h"
 #include "update_engine/common/subprocess.h"
 #include "update_engine/common/utils.h"
+#include "update_engine/payload_consumer/avb_rollback_check.h"
 
 namespace {
 
@@ -124,6 +126,16 @@ void PostinstallRunnerAction::PerformAction() {
         return CompletePostinstall(ErrorCode::kPostInstallMountError);
       }
     }
+  }
+
+  // Filesystem verification has completed. Reject rollback before running
+  // postinstall commands or allowing CompletePostinstall to activate the slot.
+  if (!CheckAvbRollbackIndexes(
+          boot_control_,
+          install_plan_,
+          android::base::GetBoolProperty(
+              "ro.update_engine.avb_rollback_check", false))) {
+    return CompletePostinstall(ErrorCode::kPayloadTimestampError);
   }
 
   // We always powerwash when rolling back, however policy can determine

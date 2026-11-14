@@ -20,6 +20,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <array>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -31,6 +34,7 @@
 #include <base/message_loop/message_loop.h>
 #endif  // BASE_VER < 780000
 #include <android-base/stringprintf.h>
+#include <android-base/test_utils.h>
 #if BASE_VER >= 780000  // CrOS
 #include <base/task/single_thread_task_executor.h>
 #endif  // BASE_VER >= 780000
@@ -38,6 +42,8 @@
 #include <brillo/message_loops/message_loop_utils.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include "update_engine/payload_consumer/avb_rollback_check.h"
 
 #include "update_engine/common/constants.h"
 #include "update_engine/common/fake_boot_control.h"
@@ -452,6 +458,183 @@ TEST_F(PostinstallRunnerActionTest, RunAsRootProgressUpdatesTest) {
   setup_action_delegate_ = &mock_delegate_;
   RunPostinstallAction(loop.dev(), "bin/postinst_progress", false, false);
   EXPECT_EQ(ErrorCode::kSuccess, processor_delegate_.code_);
+}
+
+// AVB metadata is read from complete partitions, not payload source extents.
+class AvbRollbackCheckTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    plan_.source_slot = 0;
+    plan_.target_slot = 1;
+    for (const char* name : {"vbmeta_system", "boot"}) {
+      InstallPlan::Partition part;
+      part.name = name;
+      plan_.partitions.push_back(part);
+    }
+    for (size_t i = 0; i < files_.size(); ++i) {
+      WriteImage(i, kIndex);
+      boot_control_.SetPartitionDevice(
+          i < 2 ? "vbmeta_system" : "boot", i % 2, files_[i].path);
+    }
+  }
+
+  void WriteImage(size_t i, uint64_t index) {
+    AvbVBMetaImageHeader header{};
+    memcpy(header.magic, AVB_MAGIC, AVB_MAGIC_LEN);
+    header.required_libavb_version_major = avb_htobe32(AVB_VERSION_MAJOR);
+    header.rollback_index = avb_htobe64(index);
+    ASSERT_EQ(0, ftruncate(files_[i].fd, kPartitionSize));
+    const off_t offset = i < 2 ? 0 : kVbmetaOffset;
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(header)),
+              pwrite(files_[i].fd, &header, sizeof(header), offset));
+    if (i >= 2) {
+      AvbFooter footer{};
+      memcpy(footer.magic, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN);
+      footer.version_major = avb_htobe32(AVB_FOOTER_VERSION_MAJOR);
+      footer.vbmeta_offset = avb_htobe64(kVbmetaOffset);
+      footer.vbmeta_size = avb_htobe64(sizeof(header));
+      ASSERT_EQ(static_cast<ssize_t>(sizeof(footer)),
+                pwrite(files_[i].fd,
+                       &footer,
+                       sizeof(footer),
+                       kPartitionSize - sizeof(footer)));
+    }
+  }
+
+  bool Check(bool enabled = true) {
+    return CheckAvbRollbackIndexes(&boot_control_, plan_, enabled);
+  }
+
+  static constexpr uint64_t kIndex = uint64_t{1} << 40;
+  static constexpr off_t kPartitionSize = 8192;
+  static constexpr off_t kVbmetaOffset = 4096;
+  std::array<TemporaryFile, 4> files_;
+  FakeBootControl boot_control_;
+  InstallPlan plan_;
+};
+
+TEST_F(AvbRollbackCheckTest, EqualIndexes) {
+  EXPECT_TRUE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, HigherIndexes) {
+  WriteImage(1, kIndex + 1);
+  WriteImage(3, std::numeric_limits<uint64_t>::max());
+  EXPECT_TRUE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, LowerSystemIndex) {
+  WriteImage(1, kIndex - 1);
+  WriteImage(3, kIndex + 1);
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, LowerBootIndex) {
+  WriteImage(1, kIndex + 1);
+  WriteImage(3, kIndex - 1);
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, FullAndIncrementalPayloads) {
+  // Full payloads do not supply source paths or source sizes.
+  EXPECT_TRUE(Check());
+  for (auto& part : plan_.partitions) {
+    part.source_size = kPartitionSize;
+  }
+  EXPECT_TRUE(Check());
+  // A later slot-switch request can omit the partition list entirely.
+  plan_.partitions.clear();
+  EXPECT_TRUE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, MissingPartitionDevices) {
+  for (size_t i = 0; i < files_.size(); ++i) {
+    const char* name = i < 2 ? "vbmeta_system" : "boot";
+    boot_control_.SetPartitionDevice(name, i % 2, "");
+    EXPECT_FALSE(Check()) << i;
+    boot_control_.SetPartitionDevice(name, i % 2, files_[i].path);
+  }
+}
+
+TEST_F(AvbRollbackCheckTest, TruncatedPartitions) {
+  for (size_t i = 0; i < files_.size(); ++i) {
+    ASSERT_EQ(0, ftruncate(files_[i].fd, sizeof(AvbVBMetaImageHeader) - 1));
+    EXPECT_FALSE(Check()) << i;
+    WriteImage(i, kIndex);
+  }
+}
+
+TEST_F(AvbRollbackCheckTest, MalformedHeaders) {
+  for (size_t i = 0; i < files_.size(); ++i) {
+    AvbVBMetaImageHeader invalid{};
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(invalid)),
+              pwrite(files_[i].fd,
+                     &invalid,
+                     sizeof(invalid),
+                     i < 2 ? 0 : kVbmetaOffset));
+    EXPECT_FALSE(Check()) << i;
+    WriteImage(i, kIndex);
+  }
+}
+
+TEST_F(AvbRollbackCheckTest, MalformedFooter) {
+  AvbFooter invalid{};
+  ASSERT_EQ(static_cast<ssize_t>(sizeof(invalid)),
+            pwrite(files_[3].fd,
+                   &invalid,
+                   sizeof(invalid),
+                   kPartitionSize - sizeof(invalid)));
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, FooterOffsetOverflow) {
+  AvbFooter footer{};
+  memcpy(footer.magic, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN);
+  footer.vbmeta_offset = avb_htobe64(std::numeric_limits<uint64_t>::max());
+  footer.vbmeta_size = avb_htobe64(sizeof(AvbVBMetaImageHeader));
+  ASSERT_EQ(static_cast<ssize_t>(sizeof(footer)),
+            pwrite(files_[3].fd,
+                   &footer,
+                   sizeof(footer),
+                   kPartitionSize - sizeof(footer)));
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, HeaderSizeOverflow) {
+  AvbVBMetaImageHeader header{};
+  memcpy(header.magic, AVB_MAGIC, AVB_MAGIC_LEN);
+  header.required_libavb_version_major = avb_htobe32(AVB_VERSION_MAJOR);
+  header.authentication_data_block_size =
+      avb_htobe64(std::numeric_limits<uint64_t>::max());
+  ASSERT_EQ(static_cast<ssize_t>(sizeof(header)),
+            pwrite(files_[1].fd, &header, sizeof(header), 0));
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, UnsupportedHeaderVersion) {
+  AvbVBMetaImageHeader header{};
+  memcpy(header.magic, AVB_MAGIC, AVB_MAGIC_LEN);
+  header.required_libavb_version_major = avb_htobe32(AVB_VERSION_MAJOR + 1);
+  ASSERT_EQ(static_cast<ssize_t>(sizeof(header)),
+            pwrite(files_[1].fd, &header, sizeof(header), 0));
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, InvalidSlots) {
+  plan_.source_slot = 1;
+  EXPECT_FALSE(Check());
+  plan_.source_slot = 0;
+  plan_.target_slot = 0;
+  EXPECT_FALSE(Check());
+  plan_.target_slot = BootControlInterface::kInvalidSlot;
+  EXPECT_FALSE(Check());
+}
+
+TEST_F(AvbRollbackCheckTest, DisabledSkipsAllReads) {
+  WriteImage(1, 0);
+  EXPECT_TRUE(Check(false));
+  FakeBootControl missing_devices;
+  EXPECT_TRUE(CheckAvbRollbackIndexes(&missing_devices, InstallPlan{}, false));
 }
 
 }  // namespace chromeos_update_engine
